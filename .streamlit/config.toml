@@ -1,0 +1,9 @@
+[server]
+address = "127.0.0.1"
+port = 8502
+enableCORS = false
+enableXsrfProtection = true
+maxUploadSize = 1024
+
+[browser]
+gatherUsageStats = false

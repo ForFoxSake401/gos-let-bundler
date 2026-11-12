@@ -1,0 +1,19 @@
+{
+  "session_id": "LET_2026-11-10",
+  "created_at": "2026-11-10T15:01:24",
+  "issues": [
+    {
+      "issue_id": "ISS-01",
+      "timestamp": "2026-11-10T15:01:03.995",
+      "location": "InGate 08",
+      "window_sec": 45,
+      "included_logs": [
+        "GOS_API_Logs",
+        "GOS_Console_Errors",
+        "GOS_Message_Payloads"
+      ],
+      "highlight_key": "",
+      "notes": "something happened"
+    }
+  ]
+}
