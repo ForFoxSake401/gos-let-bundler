@@ -1,0 +1,51 @@
+name: Build Cross-Platform LET Bundler
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      - "let_standalone_app.py"
+      - "run_app.py"
+      - "build_binary.py"
+      - "requirements.txt"
+      - ".github/workflows/build_let_bundler.yml"
+  workflow_dispatch: # Allows manual 1-click trigger from the Actions tab
+
+jobs:
+  build-bundles:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: GOS_LET_Bundler_Windows_x64
+          - os: macos-14 # Native Apple Silicon (M-series) runner
+            artifact_name: GOS_LET_Bundler_macOS_arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies & PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Compile Native Bundle via build_binary.py
+        run: python build_binary.py
+
+      - name: Upload Compiled Zip Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*.zip
+          retention-days: 30
