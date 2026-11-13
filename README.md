@@ -1,4 +1,4 @@
-# 🛡️ GOS LET Issue Tracker & Standalone Evidence Bundler
+# 🛡️ LET Issue Tracker & Standalone Evidence Bundler
 
 A local-first, zero-egress Live Equipment Test (LET) issue tracker and post-test log bundler designed for Gate Operating System (GOS) testing. 
 
