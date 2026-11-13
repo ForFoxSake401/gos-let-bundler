@@ -217,12 +217,12 @@ def save_session(data: Dict):
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 # --- UI LAYOUT ---
-st.set_page_config(page_title="GOS LET Standalone Tracker", layout="wide")
+st.set_page_config(page_title="LET Standalone Tracker", layout="wide")
 
 with st.sidebar:
     st.header("🗂️ LET Session Manager")
     existing_sessions = [p.stem for p in sorted(SESSION_DIR.glob("*.json"), reverse=True)]
-    default_session = f"LET_GOS_{datetime.now().strftime('%Y-%m-%d')}"
+    default_session = f"LET_{datetime.now().strftime('%Y-%m-%d')}"
     if default_session not in existing_sessions:
         existing_sessions.insert(0, default_session)
 
@@ -234,8 +234,8 @@ with st.sidebar:
     st.caption(f"Saved locally at: `sessions/{active_session_id}.json`")
     st.metric("Tracked Issues in Session", len(session_data["issues"]))
 
-st.title("🛡️ GOS LET Issue Tracker & Standalone Evidence Bundler")
-st.caption("100% Offline Standalone • Streamed Disk Reader • Cross-Log Chronological Interleaving • Neutral Telemetry")
+st.title("🛡️ LET Issue Tracker & Evidence Bundler")
+st.caption("100% Offline Standalone • Streamed Disk Reader • Cross-Log Chronological Interleaving")
 
 tab_capture, tab_harvest = st.tabs(["⚡ Phase 1: Live LET Issue Capture", "📦 Phase 2: Post-LET Log Harvester & Summary"])
 
@@ -247,7 +247,7 @@ with tab_capture:
             st.session_state["frozen_ts"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
         current_frozen = st.session_state.get("frozen_ts", datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3])
         st.success(f"**Locked Mark:** `{current_frozen}`")
-        q_lane = st.radio("Quick Lane Select", ["Lane 01", "Lane 02", "Lane 03", "Lane 04", "Outgate Kiosk", "Custom"], horizontal=True)
+        q_lane = st.radio("Quick Lane Select", ["InGate 08", "InGate 09", "Trouble 29", "Trouble 30", "OutGate 27", "PED 01", "PED 02", "PED 03", "PED 04", "PED 07", "PED 08", "PED 09", "PED 10", "PED 11", "PED 12", "PED 13", "PED 14", "PED 15", "PED 16", "PED 17", "LSTZ 01", "LSTZ 02", "LSTZ 03", "LSTZ 04", "LSTZ 07", "LSTZ 08", "LSTZ 09", "LSTZ 10", "LSTZ 11", "LSTZ 12", "LSTZ 13", "LSTZ 14", "LSTZ 15", "LSTZ 16", "LSTZ 17", "Custom"], horizontal=True)
 
     with col_form:
         st.subheader("2. Log Symptom & Target Streams")
@@ -256,7 +256,7 @@ with tab_capture:
             lane_val = f_c1.text_input("Lane / Equipment ID", value="" if q_lane == "Custom" else q_lane)
             ts_val = f_c2.text_input("Issue Timestamp (ISO)", value=current_frozen)
             window_override = f_c3.number_input("Custom Window (± sec)", min_value=5, max_value=600, value=45)
-            streams_val = st.multiselect("GOS Log Streams to Include", options=DEFAULT_STREAMS, default=["GOS_API_Logs", "GOS_Console_Errors", "GOS_Message_Payloads"])
+            streams_val = st.multiselect("Log Streams to Include", options=DEFAULT_STREAMS, default=["GOS_API_Logs", "GOS_Console_Errors", "GOS_Message_Payloads"])
             filter_key = st.text_input("Optional Correlation Key / Visit ID", placeholder="e.g., VISIT-99412")
             symptom_notes = st.text_area("Observed Symptom (Visual / Operational Fact Only)")
 
