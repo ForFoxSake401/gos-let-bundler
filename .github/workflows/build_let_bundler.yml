@@ -49,5 +49,3 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: dist/*.zip
           retention-days: 30
-          path: dist/*.zip
-          retention-days: 30
