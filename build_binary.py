@@ -41,7 +41,8 @@ def build():
     dist_app_dir = Path("dist") / APP_NAME
     (dist_app_dir / "let_logs").mkdir(parents=True, exist_ok=True)
     (dist_app_dir / "sessions").mkdir(parents=True, exist_ok=True)
-
+    if system == "darwin" and Path("Unlock_Mac_Gatekeeper.command").exists():
+        shutil.copy("Unlock_Mac_Gatekeeper.command", dist_app_dir / "Unlock_Mac_Gatekeeper.command")
     # Add a quick-start README inside the bundle
     readme_text = (
         f"{APP_NAME} ({os_label} Standalone Build)\n"
