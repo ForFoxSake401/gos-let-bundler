@@ -275,9 +275,26 @@ with tab_capture:
                 st.rerun()
 
     st.divider()
+    st.subheader(f"📋 Logged Issues ({len(session_data['issues'])})")
     for idx, iss in enumerate(session_data["issues"]):
         with st.expander(f"**{iss['issue_id']}** | `{iss['timestamp']}` | **{iss['location']}** — {iss['notes'][:70]}...", expanded=False):
-            if st.button("🗑️ Delete Issue", key=f"del_{idx}"):
+            e_c1, e_c2, e_c3 = st.columns([2, 2, 1])
+            new_ts = e_c1.text_input("Edit Timestamp", value=iss["timestamp"], key=f"ts_{idx}")
+            new_loc = e_c2.text_input("Edit Location", value=iss["location"], key=f"loc_{idx}")
+            new_win = e_c3.number_input("Window (±s)", value=iss.get("window_sec", 45), key=f"win_{idx}")
+            new_notes = st.text_area("Edit Notes", value=iss["notes"], key=f"notes_{idx}")
+
+            b_c1, b_c2 = st.columns([1, 5])
+            if b_c1.button("💾 Update", key=f"upd_{idx}"):
+                session_data["issues"][idx].update({
+                    "timestamp": new_ts.strip(),
+                    "location": new_loc.strip(),
+                    "window_sec": int(new_win),
+                    "notes": new_notes.strip()
+                })
+                save_session(session_data)
+                st.rerun()
+            if b_c2.button("🗑️ Delete Issue", key=f"del_{idx}"):
                 session_data["issues"].pop(idx)
                 save_session(session_data)
                 st.rerun()
@@ -303,7 +320,7 @@ with tab_harvest:
             zip_buffer = io.BytesIO()
             report_lines = [
                 f"# 🛡️ GOS Post-LET Objective Evidence Report: `{session_data['session_id']}`",
-                f"- **Generated:** `{datetime.now().isoformat(timespec='seconds')}` | **Offset:** `{clock_offset_hr:+}h`\n---\n"
+                f"- **Generated:** `{datetime.now().isoformat(timespec='seconds')}` | **Offset:** `{clock_offset_hr:+}h` | **Silence Threshold:** `≥{silence_thresh_sec}s`\n---\n"
             ]
 
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -314,6 +331,8 @@ with tab_harvest:
                     start_dt, end_dt = marked_dt - timedelta(seconds=win_sec), marked_dt + timedelta(seconds=win_sec)
 
                     report_lines.append(f"## `{iss_id}` — {issue['location']} (`{issue['timestamp']}`)")
+                    if issue.get("highlight_key"):
+                        report_lines.append(f"- **Tagged Correlation / Lookup Key:** `{issue['highlight_key']}`")
                     report_lines.append(f"- **Observed Symptom:** {issue['notes']}\n")
 
                     merged_timeline: List[Tuple[datetime, str, str]] = []
@@ -322,6 +341,7 @@ with tab_harvest:
                     for stream_name in issue["included_logs"]:
                         fpath = stream_mapping.get(stream_name)
                         if not fpath or not fpath.exists():
+                            per_stream_blocks.append(f"#### 📁 `{stream_name}`: *(No log file mapped)*")
                             continue
                         sliced_tuples = NeutralSummaryEngine.extract_slice(fpath, start_dt, end_dt, mask_ips=mask_ips_flag)
                         raw_lines = [line for _, line in sliced_tuples]
@@ -331,32 +351,60 @@ with tab_harvest:
                         slice_text = "\n".join(raw_lines)
                         sha_short = hashlib.sha256(slice_text.encode("utf-8")).hexdigest()[:16]
                         zf.writestr(f"slices/{iss_id}_{stream_name}.log", slice_text or "[No matching lines]")
-                        per_stream_blocks.append(f"<details><summary><b>{stream_name}</b> ({len(raw_lines)} lines | SHA-256: <code>{sha_short}</code>)</summary>\n\n```text\n" + "\n".join(raw_lines[:300]) + "\n```\n</details>\n")
+                        per_stream_blocks.append(
+                            f"<details><summary><b>{stream_name}</b> ({len(raw_lines)} lines | SHA-256: <code>{sha_short}</code>)</summary>\n\n```text\n"
+                            + ("\n".join(raw_lines[:300]) if raw_lines else "[No events in window]")
+                            + "\n```\n</details>\n"
+                        )
 
                     merged_timeline.sort(key=lambda x: x[0])
                     obs = NeutralSummaryEngine.analyze_merged_events(merged_timeline, gap_threshold_sec=silence_thresh_sec)
+
+                    # Save unified cross-stream timeline into ZIP
+                    interleaved_lines = [f"[{ts.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] [{st_name}] {ln}" for ts, st_name, ln in merged_timeline]
+                    zf.writestr(f"slices/{iss_id}_UNIFIED_TIMELINE.log", "\n".join(interleaved_lines))
 
                     report_lines.append("### 📊 Automated Neutral Telemetry Breakdown")
                     report_lines.append(f"- **Total Interleaved Events:** `{obs['total_events']}`")
                     if obs["correlation_ids"]:
                         report_lines.append(f"- **Correlation / Visit IDs:** `{', '.join(obs['correlation_ids'])}`")
+                    if obs["http_codes"]:
+                        codes_str = ", ".join([f"`HTTP {k}`: {v}" for k, v in sorted(obs["http_codes"].items())])
+                        report_lines.append(f"- **Observed HTTP Status Codes:** {codes_str}")
                     for g in obs["silence_gaps"]:
                         report_lines.append(f"- **⏱️ `{g['gap_sec']}s` Silence Gap** (`{g['from_ts']}` ➔ `{g['to_ts']}`)")
+                        report_lines.append(f"  - *Before:* `{g['before']}...` | *After:* `{g['after']}...`")
+                    if obs["flagged_events"]:
+                        report_lines.append(f"- **⚠️ Flagged Error / Warn / Timeout Lines ({len(obs['flagged_events'])}):**")
+                        for fe in obs["flagged_events"][:12]:
+                            report_lines.append(f"  - `{fe}`")
 
                     payload_records = PayloadExtractor.harvest_payloads(merged_timeline)
                     report_lines.append(f"\n### 📦 Extracted JSON Message Payloads ({len(payload_records)} captured)")
                     if payload_records:
                         zf.writestr(f"slices/{iss_id}_EXTRACTED_PAYLOADS.json", json.dumps(payload_records, indent=2))
                         for p_idx, rec in enumerate(payload_records, start=1):
-                            report_lines.append(f"<details><summary><b>Payload #{p_idx}</b> | <code>{rec['timestamp']}</code> | <b>{rec['stream']}</b></summary>\n")
+                            keys_preview = ", ".join(rec["top_keys"][:6])
+                            report_lines.append(f"<details><summary><b>Payload #{p_idx}</b> | <code>{rec['timestamp']}</code> | <b>{rec['stream']}</b> — Keys: <code>[{keys_preview}]</code></summary>\n")
                             for chg in rec["state_changes"][:15]:
                                 report_lines.append(f"- {chg}")
                             report_lines.append(f"\n```json\n{rec['pretty_json']}\n```\n</details>\n")
 
+                    report_lines.append("\n### 🗂️ Individual Sanitized Log Slices")
                     report_lines.extend(per_stream_blocks)
                     report_lines.append("---\n")
 
                 final_markdown = "\n".join(report_lines)
                 zf.writestr(f"{session_data['session_id']}_Summary_Report.md", final_markdown)
+                zf.writestr(f"{session_data['session_id']}_Raw_Session.json", json.dumps(session_data, indent=2))
 
-            st.download_button("📦 Download Evidence Bundle (.zip)", data=zip_buffer.getvalue(), file_name=f"{session_data['session_id']}_Bundle.zip", mime="application/zip", use_container_width=True)
+            report_out_path = SESSION_DIR / f"{session_data['session_id']}_Summary_Report.md"
+            report_out_path.write_text(final_markdown, encoding="utf-8")
+
+            st.success(f"Evidence bundle generated and saved to `sessions/{report_out_path.name}`!")
+            dl1, dl2 = st.columns(2)
+            dl1.download_button("📦 Download Evidence Bundle (.zip)", data=zip_buffer.getvalue(), file_name=f"{session_data['session_id']}_Bundle.zip", mime="application/zip", use_container_width=True)
+            dl2.download_button("📄 Download Summary Report (.md)", data=final_markdown, file_name=f"{session_data['session_id']}_Summary_Report.md", mime="text/markdown", use_container_width=True)
+
+            with st.expander("Preview Generated Handoff Report", expanded=True):
+                st.markdown(final_markdown, unsafe_allow_html=True)
