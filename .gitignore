@@ -1,0 +1,17 @@
+# Virtual environments & PyInstaller artifacts
+.venv/
+venv/
+build/
+dist/
+*.spec
+__pycache__/
+*.py[cod]
+
+# Ignore all real logs and session data, but keep the empty directories
+let_logs/*
+!let_logs/.gitkeep
+sessions/*
+!sessions/.gitkeep
+
+# macOS metadata
+.DS_Store

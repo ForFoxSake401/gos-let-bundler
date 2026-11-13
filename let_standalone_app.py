@@ -1,16 +1,15 @@
-import streamlit as st
+import sys
 import json
 import re
 import hashlib
 import zipfile
 import io
 from datetime import datetime, timedelta
-import sys
 from pathlib import Path
 from typing import List, Dict, Tuple
+import streamlit as st
 
-# --- STANDALONE DIRECTORY SETUP ---
-# Ensures let_logs/ and sessions/ are created next to the executable or script
+# --- CROSS-PLATFORM & PYINSTALLER PATH RESOLUTION ---
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys.executable).parent.resolve()
 else:
@@ -30,7 +29,6 @@ DEFAULT_STREAMS = [
 
 # --- SECURITY: PII & CREDENTIAL SCRUBBER ---
 class LogSanitizer:
-    """Scrubs tokens, credentials, and driver/truck PII before dev handoff."""
     PATTERNS = [
         (re.compile(r'(Bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*', re.IGNORECASE), r'\1[REDACTED_TOKEN]'),
         (re.compile(r'("?(?:apiKey|token|password|secret|authorization|jwt)"?\s*:\s*"?)[^"\s,}]+("?)', re.IGNORECASE), r'\1[REDACTED_SECRET]\2'),
@@ -48,7 +46,6 @@ class LogSanitizer:
 
 # --- DETERMINISTIC NEUTRAL SUMMARY ENGINE ---
 class NeutralSummaryEngine:
-    # Matches standard ISO-8601 or log timestamps (e.g., 2026-11-10 14:22:01.412 or 2026-11-10T14:22:01.412)
     TS_REGEX = re.compile(r"(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?)")
     CORR_REGEX = re.compile(
         r'(?:visitId|txId|transactionId|correlationId|laneId|kioskId|containerNo|chassisNo)["\s:=]+([A-Za-z0-9\-_]+)',
@@ -62,7 +59,6 @@ class NeutralSummaryEngine:
         if not match:
             return None
         raw_ts = match.group(1).replace(" ", "T")
-        # Pad or trim fractional seconds to 6 digits if needed for fromisoformat
         try:
             return datetime.fromisoformat(raw_ts)
         except ValueError:
@@ -70,7 +66,6 @@ class NeutralSummaryEngine:
 
     @classmethod
     def extract_slice(cls, file_path: Path, start_dt: datetime, end_dt: datetime, mask_ips: bool) -> List[Tuple[datetime | None, str]]:
-        """Streams a potentially large log file from disk without loading the whole file into RAM."""
         extracted = []
         capturing = False
         last_valid_ts = None
@@ -85,199 +80,31 @@ class NeutralSummaryEngine:
                 if ts:
                     last_valid_ts = ts
                     capturing = (start_dt <= ts <= end_dt)
-                    # Early exit optimization if logs are strictly chronological and we passed end_dt by > 10 mins
                     if ts > end_dt + timedelta(minutes=10):
                         break
                 if capturing:
                     clean_line = LogSanitizer.sanitize_line(line, mask_ips=mask_ips)
                     extracted.append((last_valid_ts, clean_line))
         return extracted
-class PayloadExtractor:
-    """Extracts embedded JSON objects from log lines, pretty-prints them, and computes neutral key diffs."""
-    DECODER = json.JSONDecoder()
 
-    @classmethod
-    def extract_json_from_line(cls, line: str) -> Tuple[str | None, Dict | List | None]:
-        """Finds and parses the first valid JSON object or array embedded in a log line."""
-        for idx, char in enumerate(line):
-            if char in ("{", "["):
-                try:
-                    obj, end_idx = cls.DECODER.raw_decode(line, idx)
-                    if isinstance(obj, (dict, list)) and len(obj) > 0:
-                        prefix = line[:idx].strip()
-                        return prefix, obj
-                except json.JSONDecodeError:
-                    continue
-        return None, None
-
-    @classmethod
-    def flatten_dict(cls, d: Dict, parent_key: str = "", sep: str = ".") -> Dict[str, any]:
-        """Flattens nested JSON dictionaries so sequential payloads can be compared objectively."""
-        items = []
-        for k, v in d.items():
-            new_key = f"{parent_key}{sep}{k}" if parent_key else k
-            if isinstance(v, dict):
-                items.extend(cls.flatten_dict(v, new_key, sep=sep).items())
-            elif isinstance(v, list):
-                items.append((new_key, json.dumps(v, sort_keys=True)))
-            else:
-                items.append((new_key, v))
-        return dict(items)
-
-    @classmethod
-    def diff_consecutive_payloads(cls, prev_obj: Dict, curr_obj: Dict) -> List[str]:
-        """Lists strictly objective field changes between two JSON dict payloads."""
-        if not isinstance(prev_obj, dict) or not isinstance(curr_obj, dict):
-            return []
-        flat_prev = cls.flatten_dict(prev_obj)
-        flat_curr = cls.flatten_dict(curr_obj)
-        diffs = []
-
-        all_keys = sorted(set(flat_prev.keys()) | set(flat_curr.keys()))
-        for k in all_keys:
-            # Skip noisy timestamp fields in diff summary
-            if any(ts_word in k.lower() for ts_word in ["timestamp", "time", "createdat", "updatedat"]):
-                continue
-            if k not in flat_prev:
-                diffs.append(f"➕ Added `{k}`: `{flat_curr[k]}`")
-            elif k not in flat_curr:
-                diffs.append(f"➖ Removed `{k}` (was `{flat_prev[k]}`)")
-            elif flat_prev[k] != flat_curr[k]:
-                diffs.append(f"🔄 Changed `{k}`: `{flat_prev[k]}` ➔ `{flat_curr[k]}`")
-        return diffs
-
-    @classmethod
-    def harvest_payloads(cls, merged_events: List[Tuple[datetime, str, str]]) -> List[Dict]:
-        """Scans interleaved events in the issue window and builds structured payload records."""
-        harvested = []
-        prev_dict_obj = None
-
-        for ts, stream, line in merged_events:
-            prefix, obj = cls.extract_json_from_line(line)
-            if obj is not None:
-                pretty_json = json.dumps(obj, indent=2, sort_keys=True)
-                top_keys = list(obj.keys()) if isinstance(obj, dict) else [f"Array[{len(obj)}]"]
-                
-                state_changes = []
-                if isinstance(obj, dict) and prev_dict_obj is not None:
-                    state_changes = cls.diff_consecutive_payloads(prev_dict_obj, obj)
-                if isinstance(obj, dict):
-                    prev_dict_obj = obj
-
-                harvested.append({
-                    "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-                    "stream": stream,
-                    "prefix": prefix[:100] if prefix else "",
-                    "top_keys": top_keys,
-                    "pretty_json": pretty_json,
-                    "state_changes": state_changes
-                })
-        return harvested
-class PayloadExtractor:
-    """Extracts embedded JSON objects from log lines, pretty-prints them, and computes neutral key diffs."""
-    DECODER = json.JSONDecoder()
-
-    @classmethod
-    def extract_json_from_line(cls, line: str) -> Tuple[str | None, Dict | List | None]:
-        """Finds and parses the first valid JSON object or array embedded in a log line."""
-        for idx, char in enumerate(line):
-            if char in ("{", "["):
-                try:
-                    obj, end_idx = cls.DECODER.raw_decode(line, idx)
-                    if isinstance(obj, (dict, list)) and len(obj) > 0:
-                        prefix = line[:idx].strip()
-                        return prefix, obj
-                except json.JSONDecodeError:
-                    continue
-        return None, None
-
-    @classmethod
-    def flatten_dict(cls, d: Dict, parent_key: str = "", sep: str = ".") -> Dict[str, any]:
-        """Flattens nested JSON dictionaries so sequential payloads can be compared objectively."""
-        items = []
-        for k, v in d.items():
-            new_key = f"{parent_key}{sep}{k}" if parent_key else k
-            if isinstance(v, dict):
-                items.extend(cls.flatten_dict(v, new_key, sep=sep).items())
-            elif isinstance(v, list):
-                items.append((new_key, json.dumps(v, sort_keys=True)))
-            else:
-                items.append((new_key, v))
-        return dict(items)
-
-    @classmethod
-    def diff_consecutive_payloads(cls, prev_obj: Dict, curr_obj: Dict) -> List[str]:
-        """Lists strictly objective field changes between two JSON dict payloads."""
-        if not isinstance(prev_obj, dict) or not isinstance(curr_obj, dict):
-            return []
-        flat_prev = cls.flatten_dict(prev_obj)
-        flat_curr = cls.flatten_dict(curr_obj)
-        diffs = []
-
-        all_keys = sorted(set(flat_prev.keys()) | set(flat_curr.keys()))
-        for k in all_keys:
-            # Skip noisy timestamp fields in diff summary
-            if any(ts_word in k.lower() for ts_word in ["timestamp", "time", "createdat", "updatedat"]):
-                continue
-            if k not in flat_prev:
-                diffs.append(f"➕ Added `{k}`: `{flat_curr[k]}`")
-            elif k not in flat_curr:
-                diffs.append(f"➖ Removed `{k}` (was `{flat_prev[k]}`)")
-            elif flat_prev[k] != flat_curr[k]:
-                diffs.append(f"🔄 Changed `{k}`: `{flat_prev[k]}` ➔ `{flat_curr[k]}`")
-        return diffs
-
-    @classmethod
-    def harvest_payloads(cls, merged_events: List[Tuple[datetime, str, str]]) -> List[Dict]:
-        """Scans interleaved events in the issue window and builds structured payload records."""
-        harvested = []
-        prev_dict_obj = None
-
-        for ts, stream, line in merged_events:
-            prefix, obj = cls.extract_json_from_line(line)
-            if obj is not None:
-                pretty_json = json.dumps(obj, indent=2, sort_keys=True)
-                top_keys = list(obj.keys()) if isinstance(obj, dict) else [f"Array[{len(obj)}]"]
-                
-                state_changes = []
-                if isinstance(obj, dict) and prev_dict_obj is not None:
-                    state_changes = cls.diff_consecutive_payloads(prev_dict_obj, obj)
-                if isinstance(obj, dict):
-                    prev_dict_obj = obj
-
-                harvested.append({
-                    "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-                    "stream": stream,
-                    "prefix": prefix[:100] if prefix else "",
-                    "top_keys": top_keys,
-                    "pretty_json": pretty_json,
-                    "state_changes": state_changes
-                })
-        return harvested
-            
     @classmethod
     def analyze_merged_events(cls, merged_events: List[Tuple[datetime, str, str]], gap_threshold_sec: float) -> Dict:
-        """Analyzes the interleaved cross-stream events objectively."""
         flagged_events = []
         correlation_ids = set()
         http_codes = {}
         silence_gaps = []
 
         for i, (ts, stream, line) in enumerate(merged_events):
-            # Extract correlation identifiers
             for m in cls.CORR_REGEX.findall(line):
                 if len(m) > 2 and m.lower() not in ("null", "none", "true", "false"):
                     correlation_ids.add(m)
 
-            # Extract HTTP status codes
             for code in cls.HTTP_STATUS_REGEX.findall(line):
                 http_codes[code] = http_codes.get(code, 0) + 1
 
-            # Flag explicit error/warn/timeout lines
             if any(k in line.upper() for k in ["ERROR", "WARN", "EXCEPTION", "TIMEOUT", "FAILED", "FAULT", "REJECT"]):
                 flagged_events.append(f"[{ts.strftime('%H:%M:%S.%f')[:-3]} | {stream}] {line[:150]}")
 
-            # Check silence gap from previous timestamped event
             if i > 0:
                 prev_ts, prev_stream, prev_line = merged_events[i - 1]
                 delta = (ts - prev_ts).total_seconds()
@@ -297,6 +124,78 @@ class PayloadExtractor:
             "flagged_events": flagged_events,
             "silence_gaps": silence_gaps
         }
+
+# --- JSON PAYLOAD EXTRACTOR & STATE DIFF ENGINE ---
+class PayloadExtractor:
+    DECODER = json.JSONDecoder()
+
+    @classmethod
+    def extract_json_from_line(cls, line: str) -> Tuple[str | None, Dict | List | None]:
+        for idx, char in enumerate(line):
+            if char in ("{", "["):
+                try:
+                    obj, _ = cls.DECODER.raw_decode(line, idx)
+                    if isinstance(obj, (dict, list)) and len(obj) > 0:
+                        return line[:idx].strip(), obj
+                except json.JSONDecodeError:
+                    continue
+        return None, None
+
+    @classmethod
+    def flatten_dict(cls, d: Dict, parent_key: str = "", sep: str = ".") -> Dict[str, any]:
+        items = []
+        for k, v in d.items():
+            new_key = f"{parent_key}{sep}{k}" if parent_key else k
+            if isinstance(v, dict):
+                items.extend(cls.flatten_dict(v, new_key, sep=sep).items())
+            elif isinstance(v, list):
+                items.append((new_key, json.dumps(v, sort_keys=True)))
+            else:
+                items.append((new_key, v))
+        return dict(items)
+
+    @classmethod
+    def diff_consecutive_payloads(cls, prev_obj: Dict, curr_obj: Dict) -> List[str]:
+        if not isinstance(prev_obj, dict) or not isinstance(curr_obj, dict):
+            return []
+        flat_prev = cls.flatten_dict(prev_obj)
+        flat_curr = cls.flatten_dict(curr_obj)
+        diffs = []
+
+        for k in sorted(set(flat_prev.keys()) | set(flat_curr.keys())):
+            if any(t in k.lower() for t in ["timestamp", "time", "createdat", "updatedat"]):
+                continue
+            if k not in flat_prev:
+                diffs.append(f"➕ Added `{k}`: `{flat_curr[k]}`")
+            elif k not in flat_curr:
+                diffs.append(f"➖ Removed `{k}` (was `{flat_prev[k]}`)")
+            elif flat_prev[k] != flat_curr[k]:
+                diffs.append(f"🔄 Changed `{k}`: `{flat_prev[k]}` ➔ `{flat_curr[k]}`")
+        return diffs
+
+    @classmethod
+    def harvest_payloads(cls, merged_events: List[Tuple[datetime, str, str]]) -> List[Dict]:
+        harvested = []
+        prev_dict_obj = None
+        for ts, stream, line in merged_events:
+            prefix, obj = cls.extract_json_from_line(line)
+            if obj is not None:
+                pretty_json = json.dumps(obj, indent=2, sort_keys=True)
+                top_keys = list(obj.keys()) if isinstance(obj, dict) else [f"Array[{len(obj)}]"]
+                state_changes = []
+                if isinstance(obj, dict) and prev_dict_obj is not None:
+                    state_changes = cls.diff_consecutive_payloads(prev_dict_obj, obj)
+                if isinstance(obj, dict):
+                    prev_dict_obj = obj
+                harvested.append({
+                    "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                    "stream": stream,
+                    "prefix": prefix[:100] if prefix else "",
+                    "top_keys": top_keys,
+                    "pretty_json": pretty_json,
+                    "state_changes": state_changes
+                })
+        return harvested
 
 # --- SESSION PERSISTENCE ---
 def get_session_path(session_name: str) -> Path:
@@ -318,45 +217,37 @@ def save_session(data: Dict):
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 # --- UI LAYOUT ---
-st.set_page_config(page_title="LET Standalone Tracker", layout="wide")
+st.set_page_config(page_title="GOS LET Standalone Tracker", layout="wide")
 
 with st.sidebar:
     st.header("🗂️ LET Session Manager")
     existing_sessions = [p.stem for p in sorted(SESSION_DIR.glob("*.json"), reverse=True)]
-    default_session = f"LET_{datetime.now().strftime('%Y-%m-%d')}"
+    default_session = f"LET_GOS_{datetime.now().strftime('%Y-%m-%d')}"
     if default_session not in existing_sessions:
         existing_sessions.insert(0, default_session)
 
     selected_session = st.selectbox("Active Session", options=existing_sessions)
-    custom_session = st.text_input("Or Create New Session ID", placeholder="e.g., LET_2026-11-12_(area)")
+    custom_session = st.text_input("Or Create New Session ID", placeholder="e.g., LET_GOS_2026-11-12_GateB")
     active_session_id = custom_session.strip() if custom_session.strip() else selected_session
 
     session_data = load_session(active_session_id)
     st.caption(f"Saved locally at: `sessions/{active_session_id}.json`")
     st.metric("Tracked Issues in Session", len(session_data["issues"]))
 
-st.title("🛡️ LET Issue Tracker & Evidence Bundler")
+st.title("🛡️ GOS LET Issue Tracker & Standalone Evidence Bundler")
 st.caption("100% Offline Standalone • Streamed Disk Reader • Cross-Log Chronological Interleaving • Neutral Telemetry")
 
 tab_capture, tab_harvest = st.tabs(["⚡ Phase 1: Live LET Issue Capture", "📦 Phase 2: Post-LET Log Harvester & Summary"])
 
-# ==========================================
-# TAB 1: LIVE LET CAPTURE
-# ==========================================
 with tab_capture:
     col_btn, col_form = st.columns([1, 2.2])
-
     with col_btn:
         st.subheader("1. Instant Timestamp Lock")
-        st.write("Hit this button the exact moment an issue occurs on the lane. It freezes the clock so you can take notes calmly.")
         if st.button("⚡ FREEZE TIMESTAMP NOW", type="primary", use_container_width=True):
             st.session_state["frozen_ts"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
-
         current_frozen = st.session_state.get("frozen_ts", datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3])
         st.success(f"**Locked Mark:** `{current_frozen}`")
-
-        st.markdown("##### Quick Pre-Fill Tags")
-        q_lane = st.radio("Quick Lane Select", ["InGate 08", "InGate 09", "OutGate 27", "Trouble 29", "Trouble 30", "PEDESTAL(any)", "LSTZ Lane(any)"], horizontal=True)
+        q_lane = st.radio("Quick Lane Select", ["Lane 01", "Lane 02", "Lane 03", "Lane 04", "Outgate Kiosk", "Custom"], horizontal=True)
 
     with col_form:
         st.subheader("2. Log Symptom & Target Streams")
@@ -365,17 +256,9 @@ with tab_capture:
             lane_val = f_c1.text_input("Lane / Equipment ID", value="" if q_lane == "Custom" else q_lane)
             ts_val = f_c2.text_input("Issue Timestamp (ISO)", value=current_frozen)
             window_override = f_c3.number_input("Custom Window (± sec)", min_value=5, max_value=600, value=45)
-
-            streams_val = st.multiselect(
-                "GOS Log Streams to Include in Breakdown",
-                options=DEFAULT_STREAMS,
-                default=["GOS_API_Logs", "GOS_Console_Errors", "GOS_Message_Payloads"]
-            )
-            filter_key = st.text_input("Optional Correlation Key / License Plate / Visit ID (to highlight)", placeholder="e.g., VISIT-99412 or Plate 8XYZ123")
-            symptom_notes = st.text_area(
-                "Observed Symptom (Visual / Operational Fact Only)",
-                placeholder="What did the operator/driver experience? e.g., Pedestal screen stayed on 'Processing' for 20s after barcode scan."
-            )
+            streams_val = st.multiselect("GOS Log Streams to Include", options=DEFAULT_STREAMS, default=["GOS_API_Logs", "GOS_Console_Errors", "GOS_Message_Payloads"])
+            filter_key = st.text_input("Optional Correlation Key / Visit ID", placeholder="e.g., VISIT-99412")
+            symptom_notes = st.text_area("Observed Symptom (Visual / Operational Fact Only)")
 
             if st.form_submit_button("💾 Log Issue to Session", use_container_width=True):
                 new_id = f"ISS-{len(session_data['issues']) + 1:02d}"
@@ -389,64 +272,29 @@ with tab_capture:
                     "notes": symptom_notes.strip()
                 })
                 save_session(session_data)
-                st.toast(f"Logged {new_id} at {ts_val}", icon="✅")
                 st.rerun()
 
     st.divider()
-    st.subheader("📋 Logged Issues in Current LET Session")
-    if not session_data["issues"]:
-        st.info("No issues logged yet. Use the Freeze Timestamp button above during your LET.")
-    else:
-        for idx, iss in enumerate(session_data["issues"]):
-            with st.expander(f"**{iss['issue_id']}** | `{iss['timestamp']}` | **{iss['location']}** — {iss['notes'][:70]}...", expanded=False):
-                e_c1, e_c2, e_c3 = st.columns([2, 2, 1])
-                new_ts = e_c1.text_input("Edit Timestamp", value=iss["timestamp"], key=f"ts_{idx}")
-                new_loc = e_c2.text_input("Edit Location", value=iss["location"], key=f"loc_{idx}")
-                new_win = e_c3.number_input("Window (±s)", value=iss.get("window_sec", 45), key=f"win_{idx}")
-                new_notes = st.text_area("Edit Notes", value=iss["notes"], key=f"notes_{idx}")
-                
-                b_c1, b_c2 = st.columns([1, 5])
-                if b_c1.button("Update Issue", key=f"upd_{idx}"):
-                    session_data["issues"][idx].update({
-                        "timestamp": new_ts,
-                        "location": new_loc,
-                        "window_sec": int(new_win),
-                        "notes": new_notes
-                    })
-                    save_session(session_data)
-                    st.rerun()
-                if b_c2.button("🗑️ Delete Issue", key=f"del_{idx}"):
-                    session_data["issues"].pop(idx)
-                    save_session(session_data)
-                    st.rerun()
+    for idx, iss in enumerate(session_data["issues"]):
+        with st.expander(f"**{iss['issue_id']}** | `{iss['timestamp']}` | **{iss['location']}** — {iss['notes'][:70]}...", expanded=False):
+            if st.button("🗑️ Delete Issue", key=f"del_{idx}"):
+                session_data["issues"].pop(idx)
+                save_session(session_data)
+                st.rerun()
 
-# ==========================================
-# TAB 2: POST-LET HARVESTER & BUNDLER
-# ==========================================
 with tab_harvest:
     st.subheader("1. Map Raw GOS Log Files from `./let_logs/` Folder")
-    st.caption(f"Drop your raw log files directly into `{LOG_DROP_DIR}` so you don't have to upload huge files through the browser.")
-
-    local_files = ["[None]"] + [p.name for p in sorted(LOG_DROP_DIR.iterdir()) if p.is_file()]
-    
+    local_files = ["[None]"] + [p.name for p in sorted(LOG_DROP_DIR.iterdir()) if p.is_file() and not p.name.startswith(".")]
     stream_mapping: Dict[str, Path | None] = {}
     map_cols = st.columns(len(DEFAULT_STREAMS))
     for i, stream_name in enumerate(DEFAULT_STREAMS):
         chosen = map_cols[i].selectbox(f"File for `{stream_name}`", options=local_files, key=f"map_{stream_name}")
         stream_mapping[stream_name] = (LOG_DROP_DIR / chosen) if chosen != "[None]" else None
 
-    st.subheader("2. Telemetry & Clock Alignment Settings")
     cfg1, cfg2, cfg3 = st.columns(3)
-    clock_offset_hr = cfg1.number_input(
-        "Server Clock Offset (Hours)",
-        min_value=-24.0, max_value=24.0, value=0.0, step=0.5,
-        help="If the GOS log server clock is ahead by 7 hours (e.g., UTC vs PDT), set +7.0."
-    )
-    silence_thresh_sec = cfg2.number_input(
-        "Silence / Hang Detection Threshold (Seconds)",
-        min_value=0.5, max_value=60.0, value=3.0, step=0.5
-    )
-    mask_ips_flag = cfg3.checkbox("Sanitize IPv4 Addresses & Bearer/PII Tokens", value=True)
+    clock_offset_hr = cfg1.number_input("Server Clock Offset (Hours)", min_value=-24.0, max_value=24.0, value=0.0, step=0.5)
+    silence_thresh_sec = cfg2.number_input("Silence Detection Threshold (Seconds)", min_value=0.5, max_value=60.0, value=3.0, step=0.5)
+    mask_ips_flag = cfg3.checkbox("Sanitize IPv4 Addresses & Tokens", value=True)
 
     if st.button("🚀 Generate Neutral Evidence Summary & Dev Zip Bundle", type="primary", use_container_width=True):
         if not session_data["issues"]:
@@ -455,11 +303,7 @@ with tab_harvest:
             zip_buffer = io.BytesIO()
             report_lines = [
                 f"# 🛡️ GOS Post-LET Objective Evidence Report: `{session_data['session_id']}`",
-                f"- **Generated:** `{datetime.now().isoformat(timespec='seconds')}`",
-                f"- **Server Clock Offset Applied:** `{clock_offset_hr:+} hours`",
-                f"- **Silence Gap Threshold:** `≥ {silence_thresh_sec}s`",
-                "> **Scope Note:** This report contains strictly time-aligned log slices and deterministic telemetry (time gaps, HTTP status counts, correlation IDs, and error strings) to assist engineering triage without speculating on root causes.\n",
-                "---\n"
+                f"- **Generated:** `{datetime.now().isoformat(timespec='seconds')}` | **Offset:** `{clock_offset_hr:+}h`\n---\n"
             ]
 
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -467,14 +311,9 @@ with tab_harvest:
                     iss_id = issue["issue_id"]
                     win_sec = issue.get("window_sec", 45)
                     marked_dt = datetime.fromisoformat(issue["timestamp"]) + timedelta(hours=clock_offset_hr)
-                    start_dt = marked_dt - timedelta(seconds=win_sec)
-                    end_dt = marked_dt + timedelta(seconds=win_sec)
+                    start_dt, end_dt = marked_dt - timedelta(seconds=win_sec), marked_dt + timedelta(seconds=win_sec)
 
-                    report_lines.append(f"## `{iss_id}` — {issue['location']}")
-                    report_lines.append(f"- **Marked Local Timestamp:** `{issue['timestamp']}`")
-                    report_lines.append(f"- **Target Server Window (`±{win_sec}s`):** `{start_dt.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}` to `{end_dt.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}`")
-                    if issue.get("highlight_key"):
-                        report_lines.append(f"- **Tagged Lookup Key:** `{issue['highlight_key']}`")
+                    report_lines.append(f"## `{iss_id}` — {issue['location']} (`{issue['timestamp']}`)")
                     report_lines.append(f"- **Observed Symptom:** {issue['notes']}\n")
 
                     merged_timeline: List[Tuple[datetime, str, str]] = []
@@ -483,128 +322,41 @@ with tab_harvest:
                     for stream_name in issue["included_logs"]:
                         fpath = stream_mapping.get(stream_name)
                         if not fpath or not fpath.exists():
-                            per_stream_blocks.append(f"#### 📁 `{stream_name}`: *(No log file mapped)*")
                             continue
-
                         sliced_tuples = NeutralSummaryEngine.extract_slice(fpath, start_dt, end_dt, mask_ips=mask_ips_flag)
                         raw_lines = [line for _, line in sliced_tuples]
-                        
-                        # Add to unified cross-stream timeline
                         for ts, line in sliced_tuples:
                             if ts:
                                 merged_timeline.append((ts, stream_name, line))
-
-                        # Integrity hash & save individual slice into ZIP
                         slice_text = "\n".join(raw_lines)
                         sha_short = hashlib.sha256(slice_text.encode("utf-8")).hexdigest()[:16]
-                        slice_filename = f"{iss_id}_{stream_name}.log"
-                        zf.writestr(f"slices/{slice_filename}", slice_text or "[No matching lines in window]")
+                        zf.writestr(f"slices/{iss_id}_{stream_name}.log", slice_text or "[No matching lines]")
+                        per_stream_blocks.append(f"<details><summary><b>{stream_name}</b> ({len(raw_lines)} lines | SHA-256: <code>{sha_short}</code>)</summary>\n\n```text\n" + "\n".join(raw_lines[:300]) + "\n```\n</details>\n")
 
-                        per_stream_blocks.append(
-                            f"<details><summary><b>{stream_name}</b> — {len(raw_lines)} lines captured "
-                            f"(SHA-256: <code>{sha_short}</code> | File: <code>slices/{slice_filename}</code>)</summary>\n\n```text\n"
-                            + ("\n".join(raw_lines[:300]) if raw_lines else "[No events in window]")
-                            + ("\n... [Truncated in preview, full slice in ZIP]" if len(raw_lines) > 300 else "")
-                            + "\n```\n</details>\n"
-                        )
-
-                    # Sort unified cross-stream timeline chronologically
                     merged_timeline.sort(key=lambda x: x[0])
                     obs = NeutralSummaryEngine.analyze_merged_events(merged_timeline, gap_threshold_sec=silence_thresh_sec)
-                    
-                    # --- NEW: JSON PAYLOAD EXTRACTION & FORMATTING ---
+
+                    report_lines.append("### 📊 Automated Neutral Telemetry Breakdown")
+                    report_lines.append(f"- **Total Interleaved Events:** `{obs['total_events']}`")
+                    if obs["correlation_ids"]:
+                        report_lines.append(f"- **Correlation / Visit IDs:** `{', '.join(obs['correlation_ids'])}`")
+                    for g in obs["silence_gaps"]:
+                        report_lines.append(f"- **⏱️ `{g['gap_sec']}s` Silence Gap** (`{g['from_ts']}` ➔ `{g['to_ts']}`)")
+
                     payload_records = PayloadExtractor.harvest_payloads(merged_timeline)
-                    
                     report_lines.append(f"\n### 📦 Extracted JSON Message Payloads ({len(payload_records)} captured)")
-                    if not payload_records:
-                        report_lines.append("- *No valid JSON objects detected in the selected log streams during this window.*")
-                    else:
-                        # Save all extracted JSON payloads for this issue as a clean JSON array in the ZIP
-                        zf.writestr(
-                            f"slices/{iss_id}_EXTRACTED_PAYLOADS.json",
-                            json.dumps(payload_records, indent=2)
-                        )
-                        
+                    if payload_records:
+                        zf.writestr(f"slices/{iss_id}_EXTRACTED_PAYLOADS.json", json.dumps(payload_records, indent=2))
                         for p_idx, rec in enumerate(payload_records, start=1):
-                            keys_preview = ", ".join(rec["top_keys"][:6])
-                            if len(rec["top_keys"]) > 6:
-                                keys_preview += ", ..."
-                                
-                            report_lines.append(
-                                f"<details><summary><b>Payload #{p_idx}</b> | <code>{rec['timestamp']}</code> | "
-                                f"<b>{rec['stream']}</b> — Keys: <code>[{keys_preview}]</code></summary>\n"
-                            )
-                            if rec["prefix"]:
-                                report_lines.append(f"- **Log Context Prefix:** `{rec['prefix']}`")
-                            
-                            # Show objective field changes from the immediately preceding JSON payload
-                            if rec["state_changes"]:
-                                report_lines.append("- **Observed Field Changes from Previous Payload:**")
-                                for chg in rec["state_changes"][:15]:
-                                    report_lines.append(f"  - {chg}")
-                                if len(rec["state_changes"]) > 15:
-                                    report_lines.append(f"  - *...and {len(rec['state_changes']) - 15} more field changes*")
-                                    
+                            report_lines.append(f"<details><summary><b>Payload #{p_idx}</b> | <code>{rec['timestamp']}</code> | <b>{rec['stream']}</b></summary>\n")
+                            for chg in rec["state_changes"][:15]:
+                                report_lines.append(f"- {chg}")
                             report_lines.append(f"\n```json\n{rec['pretty_json']}\n```\n</details>\n")
 
-                    # Write Objective Telemetry Summary
-                    report_lines.append("### 📊 Automated Neutral Telemetry Breakdown")
-                    report_lines.append(f"- **Total Interleaved Events Across Selected Streams:** `{obs['total_events']}`")
-                    
-                    if obs["correlation_ids"]:
-                        report_lines.append(f"- **Extracted Correlation / Visit / Lane IDs:** `{', '.join(obs['correlation_ids'])}`")
-                    if obs["http_codes"]:
-                        codes_str = ", ".join([f"`HTTP {k}`: {v}" for k, v in sorted(obs["http_codes"].items())])
-                        report_lines.append(f"- **Observed HTTP Status Codes in Window:** {codes_str}")
-
-                    if obs["silence_gaps"]:
-                        report_lines.append(f"- **⏱️ Detected Silence / Hang Gaps (≥ {silence_thresh_sec}s across streams):**")
-                        for g in obs["silence_gaps"]:
-                            report_lines.append(f"  - **`{g['gap_sec']}s` silence** from `{g['from_ts']}` to `{g['to_ts']}`")
-                            report_lines.append(f"    - *Last event before silence:* `{g['before']}...`")
-                            report_lines.append(f"    - *First event after silence:* `{g['after']}...`")
-                    else:
-                        report_lines.append(f"- **⏱️ Detected Silence / Hang Gaps:** None ≥ `{silence_thresh_sec}s`")
-
-                    if obs["flagged_events"]:
-                        report_lines.append(f"- **⚠️ Flagged Error / Warn / Timeout Lines ({len(obs['flagged_events'])}):**")
-                        for fe in obs["flagged_events"][:12]:
-                            report_lines.append(f"  - `{fe}`")
-                    else:
-                        report_lines.append("- **⚠️ Flagged Error / Warn / Timeout Lines:** None detected in window.")
-
-                    # Save unified interleaved timeline to ZIP
-                    interleaved_lines = [f"[{ts.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] [{st_name}] {ln}" for ts, st_name, ln in merged_timeline]
-                    zf.writestr(f"slices/{iss_id}_UNIFIED_TIMELINE.log", "\n".join(interleaved_lines))
-
-                    report_lines.append("\n### 🗂️ Individual Sanitized Log Slices")
                     report_lines.extend(per_stream_blocks)
                     report_lines.append("---\n")
 
                 final_markdown = "\n".join(report_lines)
                 zf.writestr(f"{session_data['session_id']}_Summary_Report.md", final_markdown)
-                zf.writestr(f"{session_data['session_id']}_Raw_Session.json", json.dumps(session_data, indent=2))
 
-            # Also write markdown locally to sessions/
-            report_out_path = SESSION_DIR / f"{session_data['session_id']}_Summary_Report.md"
-            report_out_path.write_text(final_markdown, encoding="utf-8")
-
-            st.success(f"Evidence bundle built! Saved locally to `{report_out_path.name}`")
-            dl_c1, dl_c2 = st.columns(2)
-            dl_c1.download_button(
-                "📦 Download Complete Evidence Bundle (.zip with Report + Log Slices)",
-                data=zip_buffer.getvalue(),
-                file_name=f"{session_data['session_id']}_Evidence_Bundle.zip",
-                mime="application/zip",
-                use_container_width=True
-            )
-            dl_c2.download_button(
-                "📄 Download Standalone Markdown Summary Only (.md)",
-                data=final_markdown,
-                file_name=f"{session_data['session_id']}_Summary_Report.md",
-                mime="text/markdown",
-                use_container_width=True
-            )
-
-            with st.expander("Preview Markdown Report", expanded=True):
-                st.markdown(final_markdown, unsafe_allow_html=True)
+            st.download_button("📦 Download Evidence Bundle (.zip)", data=zip_buffer.getvalue(), file_name=f"{session_data['session_id']}_Bundle.zip", mime="application/zip", use_container_width=True)
