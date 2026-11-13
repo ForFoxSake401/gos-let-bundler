@@ -5,9 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gos-let-bundler"
 version = "1.0.0"
-description = "Standalone GOS Live Equipment Test Issue Tracker & Evidence Bundler"
-readme = "README.md"
+description = "Standalone Live Equipment Test Issue Tracker & Evidence Bundler"
 requires-python = ">=3.10"
 dependencies = [
     "streamlit>=1.38.0"
+]
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.0.0"
 ]
