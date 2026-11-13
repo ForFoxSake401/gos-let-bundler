@@ -19,7 +19,7 @@ jobs:
         include:
           - os: windows-latest
             artifact_name: GOS_LET_Bundler_Windows_x64
-          - os: macos-14 # Native Apple Silicon (M-series) runner
+          - os: macos-latest # Native Apple Silicon (arm64) runner
             artifact_name: GOS_LET_Bundler_macOS_arm64
 
     runs-on: ${{ matrix.os }}
